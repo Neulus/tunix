@@ -39,8 +39,8 @@ class ShardingConfig:
         fsdp = "fsdp" if not is_sampling else None
 
         return ShardingConfig(
-            emb_vd=("tp", fsdp),
-            emb_dv=(fsdp, "tp"),
+            emb_vd=(None, "tp"),
+            emb_dv=("tp", None),
             q_weight_ndh=("tp", fsdp, None),
             kv_weight_ndh=("tp", fsdp, None),
             o_weight_nhd=("tp", None, fsdp),
@@ -71,6 +71,23 @@ class ModelConfig:
     num_experts: int
     num_experts_per_tok: int
     shd_config: ShardingConfig = ShardingConfig.get_default_sharding()
+
+    @classmethod
+    def create_kanana_15b_config(cls) -> "ModelConfig":
+        """Create configuration for the Kanana model (Mixtral variant)."""
+        return cls(
+            num_layers=32,
+            vocab_size=128259,
+            embed_dim=2048,
+            hidden_dim=1152,
+            num_heads=32,
+            head_dim=128,
+            num_kv_heads=8,
+            rope_theta=16000000,
+            norm_eps=1e-05,
+            num_experts=64,
+            num_experts_per_tok=8,
+        )
 
 
 class Embedder(nnx.Module):
@@ -192,7 +209,7 @@ class Attention(nnx.Module):
         shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
     ):
         self.shd_config = shd_config
-        self.wq = Einsum(
+        self.q_proj = Einsum(
             einsum_str="BTD,DNH->BTNH",
             shape=(
                 config.embed_dim,
@@ -202,19 +219,19 @@ class Attention(nnx.Module):
             rngs=rngs,
             sharding=shd_config.q_weight_ndh,
         )
-        self.wk = Einsum(
+        self.k_proj = Einsum(
             einsum_str="BSD,DKH->BSKH",
             shape=(config.embed_dim, config.num_kv_heads, config.head_dim),
             rngs=rngs,
             sharding=shd_config.kv_weight_ndh,
         )
-        self.wv = Einsum(
+        self.v_proj = Einsum(
             einsum_str="BSD,DKH->BSKH",
             shape=(config.embed_dim, config.num_kv_heads, config.head_dim),
             rngs=rngs,
             sharding=shd_config.kv_weight_ndh,
         )
-        self.wo = Einsum(
+        self.o_proj = Einsum(
             einsum_str="BTNH,NHD->BTD",
             shape=(config.num_heads, config.head_dim, config.embed_dim),
             rngs=rngs,
@@ -233,9 +250,9 @@ class Attention(nnx.Module):
     ) -> tuple[LayerCache | None, jaxtyping.Array]:
         seq_len = x.shape[1]
 
-        query_proj = self.wq(x)
-        key_proj = self.wk(x)
-        value_proj = self.wv(x)
+        query_proj = self.q_proj(x)
+        key_proj = self.k_proj(x)
+        value_proj = self.v_proj(x)
 
         query_proj = shard(query_proj, self.shd_config.act_btnh)  # type: ignore
         key_proj = shard(key_proj, self.shd_config.act_btnh)  # type: ignore
@@ -262,16 +279,24 @@ class Attention(nnx.Module):
             )
             key_proj = jax.lax.dynamic_update_slice(cache["k"], key_proj, slice_indices)
 
-        attn = jnp.einsum("BTHD,BSHD->BHTS", query_proj, key_proj) * self.scale
+        b, t, qh, d = query_proj.shape
+        _, s, kh, _ = key_proj.shape
+
+        # GQA
+        query_proj = query_proj.reshape((b, t, kh, qh // kh, d))
+        attn = jnp.einsum("BTHGD,BSHD->BHGTS", query_proj, key_proj) * self.scale
+        attn = attn.reshape((b, qh, t, s))
 
         if attn_mask is not None:
             attn = jnp.where((jnp.expand_dims(attn_mask, -3)), attn, K_MASK)
 
         attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(key_proj.dtype)  # type: ignore
 
-        qkv = jnp.einsum("BHTS,BSHD->BTHD", attn, value_proj)
+        attn = attn.reshape((b, kh, qh // kh, t, s))
+        qkv = jnp.einsum("BHGTS,BSHD->BTHGD", attn, value_proj)
+        qkv = qkv.reshape((b, t, qh, d))
 
-        outputs = self.wo(qkv)
+        outputs = self.o_proj(qkv)
         outputs = shard(outputs, self.shd_config.act_btd)  # type: ignore
 
         if cache is not None:
@@ -287,15 +312,15 @@ class Attention(nnx.Module):
 
     @property
     def head_dim(self):
-        return self.wo.shape[1]
+        return self.o_proj.shape[1]
 
     @property
     def num_heads(self):
-        return self.wq.shape[0]
+        return self.q_proj.shape[0]
 
     @property
     def num_kv_heads(self):
-        return self.wk.shape[1]
+        return self.k_proj.shape[1]
 
 
 class MLP(nnx.Module):
@@ -417,23 +442,23 @@ class DecoderLayer(nnx.Module):
         rngs: nnx.Rngs,
         shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
     ):
-        self.attention_norm = RMSNorm(
+        self.input_layernorm = RMSNorm(
             config.embed_dim,
             norm_eps=config.norm_eps,
             rngs=rngs,
             shd_config=shd_config,
         )
-        self.attention = Attention(
+        self.self_attn = Attention(
             config=config,
             rngs=rngs,
             shd_config=shd_config,
         )
-        self.feed_forward = MOEFeedForward(
+        self.block_sparse_moe = MOEFeedForward(
             config=config,
             rngs=rngs,
             shd_config=shd_config,
         )
-        self.ffn_norm = RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.embed_dim,
             norm_eps=config.norm_eps,
             rngs=rngs,
@@ -447,8 +472,8 @@ class DecoderLayer(nnx.Module):
         cache: LayerCache | None,
         attn_mask: jaxtyping.Array,
     ) -> tuple[LayerCache | None, jaxtyping.Array]:
-        inputs_normalized = self.attention_norm(x)
-        cache, attn_output = self.attention(
+        inputs_normalized = self.input_layernorm(x)
+        cache, attn_output = self.self_attn(
             inputs_normalized,
             segment_pos,
             cache,
@@ -456,8 +481,8 @@ class DecoderLayer(nnx.Module):
         )
         attn_output += x
         residual = attn_output
-        attn_output = self.ffn_norm(attn_output)
-        outputs = residual + self.feed_forward(attn_output)
+        attn_output = self.post_attention_layernorm(attn_output)
+        outputs = residual + self.block_sparse_moe(attn_output)
         return cache, outputs
 
 
@@ -472,7 +497,7 @@ class Mixtral(nnx.Module):
         shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
     ):
         self.config = config
-        self.embedder = Embedder(
+        self.embed_tokens = Embedder(
             vocab_size=config.vocab_size,
             embed_dim=config.embed_dim,
             rngs=rngs,
@@ -488,7 +513,7 @@ class Mixtral(nnx.Module):
             norm_eps=config.norm_eps,
             shd_config=shd_config,
         )
-        self.output = Einsum(
+        self.lm_head = Einsum(
             einsum_str="BTD,DV->BTV",
             shape=(config.embed_dim, config.vocab_size),
             rngs=rngs,
@@ -532,7 +557,7 @@ class Mixtral(nnx.Module):
           new_cache: updated cache if the input cache is not None, None elsewhere.
         """
         new_cache = None if cache is None else {}
-        x = self.embedder.encode(input_tokens)
+        x = self.embed_tokens.encode(input_tokens)
 
         for i, layer in enumerate(self.layers):
             layer_name = f"layer_{i}"
@@ -549,7 +574,7 @@ class Mixtral(nnx.Module):
                 )
 
         x = self.norm(x)
-        logits = self.output(x)
+        logits = self.lm_head(x)
 
         return logits, new_cache  # pytype: disable=bad-return-type
 
