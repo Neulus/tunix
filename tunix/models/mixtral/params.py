@@ -62,17 +62,17 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
             ((1, 0), None),
         ),
         # Stacked MoE expert weights (after processing by _stack_mixtral_experts)
-        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.([0-9]+)\.w1\.weight": (
-            r"layers.\1.block_sparse_moe.experts.\2.w1.kernel",
-            ((1, 0), None),
+        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.w1\.weight": (
+            r"layers.\1.block_sparse_moe.w1",
+            ((0, 2, 1), None),
         ),
-        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.([0-9]+)\.w3\.weight": (
-            r"layers.\1.block_sparse_moe.experts.\2.w3.kernel",
-            ((1, 0), None),
+        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.w3\.weight": (
+            r"layers.\1.block_sparse_moe.w3",
+            ((0, 2, 1), None),
         ),
-        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.([0-9]+)\.w2\.weight": (
-            r"layers.\1.block_sparse_moe.experts.\2.w2.kernel",
-            ((1, 0), None),
+        r"model\.layers\.([0-9]+)\.block_sparse_moe\.experts\.w2\.weight": (
+            r"layers.\1.block_sparse_moe.w2",
+            ((0, 2, 1), None),
         ),
         # RMS Norms
         r"model\.norm\.weight": ("norm.w", None),
@@ -152,9 +152,6 @@ def create_model_from_safe_tensors(
     if not files:
         raise ValueError(f"No .safetensors files found in {file_dir}")
 
-    # if config.num_experts is not None:
-    #     tensor_dict = _stack_experts(tensor_dict)
-
     mixtral = nnx.eval_shape(lambda: model_lib.Mixtral(config, rngs=nnx.Rngs(params=0)))
 
     graph_def, abs_state = nnx.split(mixtral)
@@ -164,8 +161,12 @@ def create_model_from_safe_tensors(
 
     with jax.default_device(jax.devices("cpu")[0]):
         tensor_dict = {}
+
         for f in tqdm.tqdm(files):
             tensor_dict |= safetensors.load_file(f)
+
+        if config.num_experts is not None:
+            tensor_dict = _stack_experts(tensor_dict)
 
         for k, v in tqdm.tqdm(tensor_dict.items()):
             try:
