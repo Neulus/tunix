@@ -323,8 +323,8 @@ class Attention(nnx.Module):
         return self.k_proj.shape[1]
 
 
-class MLP(nnx.Module):
-    """MLP module."""
+class MoELayer(nnx.Module):
+    """MoE layer."""
 
     def __init__(
         self,
@@ -334,102 +334,72 @@ class MLP(nnx.Module):
         shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
     ):
         self.shd_config = shd_config
-        kernel_init_fn = nnx.initializers.zeros_init()
-        self.w1 = nnx.Linear(
-            in_features=config.embed_dim,
-            out_features=config.hidden_dim,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nnx.with_partitioning(kernel_init_fn, shd_config.ffw_weight_df),
-        )
-        self.w2 = nnx.Linear(
-            in_features=config.hidden_dim,
-            out_features=config.embed_dim,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nnx.with_partitioning(kernel_init_fn, shd_config.ffw_weight_fd),
-        )
-        self.w3 = nnx.Linear(
-            in_features=config.embed_dim,
-            out_features=config.hidden_dim,
-            use_bias=False,
-            rngs=rngs,
-            kernel_init=nnx.with_partitioning(kernel_init_fn, shd_config.ffw_weight_df),
-        )
-
-    @jax.named_scope("feed_forward")
-    def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
-        activations = nnx.silu(self.w1(x)) * self.w3(x)  # type: ignore
-        activations = shard(activations, self.shd_config.act_btf)  # type: ignore
-        outputs = self.w2(activations)
-        return outputs
-
-
-class MOEFeedForward(nnx.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        *,
-        rngs: nnx.Rngs,
-        shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
-    ):
-        self.shd_config = shd_config
-
+        self.experts_per_tok = config.num_experts_per_tok
         self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-
-        self.experts = [
-            MLP(config, rngs=rngs, shd_config=shd_config)
-            for _ in range(self.num_experts)
-        ]
         self.gate = nnx.Linear(
-            config.embed_dim,
-            self.num_experts,
+            in_features=config.embed_dim,
+            out_features=config.num_experts,
             use_bias=False,
             rngs=rngs,
+        )
+        self.w1 = nnx.Param(
+            nnx.initializers.normal()(
+                rngs.params(),
+                (config.num_experts, config.embed_dim, config.hidden_dim),
+            ),
+            sharding=shd_config.exp_weight_cdf,
+        )
+        self.w3 = nnx.Param(
+            nnx.initializers.normal()(
+                rngs.params(),
+                (config.num_experts, config.embed_dim, config.hidden_dim),
+            ),
+            sharding=shd_config.exp_weight_cdf,
+        )
+        self.w2 = nnx.Param(
+            nnx.initializers.normal()(
+                rngs.params(),
+                (config.num_experts, config.hidden_dim, config.embed_dim),
+            ),
+            sharding=shd_config.exp_weight_cfd,
         )
 
     def __call__(self, x):
-        ne = self.num_experts_per_tok
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1])  # [B*T, D]
-
-        # Compute gating scores and top-k selection
-        gates = self.gate(x)
-        scores, inds = jax.lax.top_k(gates, k=ne)
-        scores = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
-
-        # Efficient conditional computation using segment_sum
-        # First, create flattened indices and inputs
-        batch_indices = jnp.arange(x.shape[0])[:, None]  # [B*T, 1]
-        batch_indices = jnp.tile(batch_indices, (1, ne)).reshape(-1)  # [B*T*ne]
-
-        expert_indices = inds.reshape(-1)  # [B*T*ne]
-        scores_flat = scores.reshape(-1)  # [B*T*ne]
-
-        # Replicate inputs for each selected expert
-        x_replicated = jnp.repeat(x, ne, axis=0)  # [B*T*ne, D]
-
-        # Apply experts conditionally
-        def apply_expert(carry, idx):
-            expert_idx, token_idx, score, token_x = idx
-            expert_out = jax.lax.switch(
-                expert_idx,
-                [lambda x: self.experts[j](x) for j in range(self.num_experts)],
-                token_x,
-            )
-            return carry, expert_out * score
-
-        _, expert_outputs = jax.lax.scan(
-            apply_expert,
-            None,
-            (expert_indices, batch_indices, scores_flat, x_replicated),
+        scores = self.gate(x).astype(jnp.float32)  # [B,T,E]
+        routing_weights, routing_idx = jax.lax.top_k(
+            jax.nn.softmax(scores, axis=-1), self.experts_per_tok
         )
+        routing_weights = (
+            routing_weights / jnp.sum(routing_weights, axis=-1, keepdims=True)
+        ).astype(x.dtype)
 
-        # Sum contributions for each token
-        y = jax.ops.segment_sum(expert_outputs, batch_indices, num_segments=x.shape[0])
+        dispatch_mask = jax.nn.one_hot(
+            routing_idx, num_classes=self.num_experts, dtype=x.dtype
+        )  # [B, T, K, E]
+        dispatch_mask = jnp.swapaxes(dispatch_mask, -1, -2)  # [B, T, E, K]
 
-        return y.reshape(orig_shape)
+        dispatched_input = jnp.einsum(
+            "BTID,BTEK->BTED", x[:, :, None, :], dispatch_mask
+        ).astype(x.dtype)
+
+        expert_outputs = []
+        for i in range(self.num_experts):
+            expert_input = dispatched_input[:, :, i, :]
+            activations = nnx.silu(
+                jnp.einsum("BTD,DF->BTF", expert_input, self.w1[i])
+            ) * jnp.einsum("BTD,DF->BTF", expert_input, self.w3[i])
+            activations = shard(activations, self.shd_config.act_btf)  # type: ignore
+            expert_output = jnp.einsum("BTF,FD->BTD", activations, self.w2[i])
+            expert_outputs.append(expert_output)
+
+        stacked_outputs = jnp.stack(expert_outputs, axis=2)  # [B, T, E, D]
+        routing_weights = jnp.tile(
+            routing_weights[:, :, None, :], (1, 1, self.num_experts, 1)
+        )  # [B, T, E, K]
+        routing_weights = dispatch_mask * routing_weights  # [B, T, E, K]
+
+        output = jnp.einsum("BTED,BTEK->BTD", stacked_outputs, routing_weights)
+        return output
 
 
 class DecoderLayer(nnx.Module):
@@ -453,7 +423,7 @@ class DecoderLayer(nnx.Module):
             rngs=rngs,
             shd_config=shd_config,
         )
-        self.block_sparse_moe = MOEFeedForward(
+        self.block_sparse_moe = MoELayer(
             config=config,
             rngs=rngs,
             shd_config=shd_config,
