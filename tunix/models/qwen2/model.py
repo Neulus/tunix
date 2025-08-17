@@ -1,6 +1,6 @@
 # Copyright 2025 Google LLC
 #
-# Licensed under the Apache License, Version 2.0 (the "License');
+# Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LLama3 model."""
+"""Qwen2 model."""
 
 import dataclasses
-import os
 from typing import Tuple
-
 import flax
 from flax import nnx
 import jax
@@ -35,7 +33,7 @@ Cache = dict[str, LayerCache]
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class ShardingConfig:
-  """Sharding configuration for Llama3 model."""
+  """Sharding configuration for Qwen3 model."""
 
   emb_vd: Tuple[str | None, ...]
   emb_dv: Tuple[str | None, ...]
@@ -48,6 +46,9 @@ class ShardingConfig:
   act_btd: Tuple[str | None, ...]
   act_btf: Tuple[str | None, ...]
   act_btnh: Tuple[str | None, ...]
+  exp_weight_cdf: Tuple[str | None, ...]
+  exp_weight_cfd: Tuple[str | None, ...]
+  qkv_bias: Tuple[str | None, ...]
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False):
@@ -65,12 +66,15 @@ class ShardingConfig:
         act_btd=('fsdp', None, None if is_sampling else 'tp'),
         act_btf=('fsdp', None, 'tp'),
         act_btnh=('fsdp', None, 'tp', None),
+        exp_weight_cdf=('fsdp', None, 'tp'),
+        exp_weight_cfd=('fsdp', 'tp', None),
+        qkv_bias=('tp',),
     )
 
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
-  """Configuration for the Llama3 model."""
+  """Configuration for the Qwen3 model."""
 
   num_layers: int
   vocab_size: int
@@ -81,54 +85,40 @@ class ModelConfig:
   num_kv_heads: int
   rope_theta: int
   norm_eps: float
+  use_tied_embedding: bool = False
   shd_config: ShardingConfig = ShardingConfig.get_default_sharding()
-  weight_tying: bool = False  # Llama3.2 features
 
   @classmethod
-  def llama3_2_1b(cls):
+  def qwen2_5_0_5_b(cls):  # qwen2.5-0.5B
     return cls(
-        num_layers=16,
-        vocab_size=128256,
-        embed_dim=2048,
-        hidden_dim=8192,
-        num_heads=32,
+        num_layers=24,
+        vocab_size=151936,
+        embed_dim=896,
+        hidden_dim=4864,
+        num_heads=14,
         head_dim=64,
-        num_kv_heads=8,
-        norm_eps=1e-05,
-        rope_theta=500_000,
-        weight_tying=True,
-    )
-
-  # Llama3.2 3B
-  @classmethod
-  def llama3_2_3b(cls):
-    return cls(
-        num_layers=28,  # ← from num_hidden_layers
-        vocab_size=128256,  # ← from vocab_size
-        embed_dim=3072,  # ← from hidden_size
-        hidden_dim=8192,  # ← from intermediate_size
-        num_heads=24,  # ← from num_attention_heads
-        head_dim=128,  # ← from head_dim
-        num_kv_heads=8,  # ← from num_key_value_heads
-        norm_eps=1e-05,  # ← from rms_norm_eps
-        rope_theta=500_000,  # ← from rope_theta
-        weight_tying=True,
+        num_kv_heads=2,
+        norm_eps=1e-06,
+        rope_theta=1_000_000,
+        use_tied_embedding=True,
     )
 
   @classmethod
-  def llama3_1_8b(cls):
+  def qwen2_5_7_b(cls):  # qwen2.5-7B
     return cls(
-        num_layers=32,
-        vocab_size=128256,
-        embed_dim=4096,
-        hidden_dim=14336,
-        num_heads=32,
+        num_layers=28,
+        vocab_size=152064,
+        embed_dim=3584,
+        hidden_dim=18944,
+        num_heads=28,
         head_dim=128,
-        num_kv_heads=8,
-        norm_eps=1e-05,
-        rope_theta=500_000,
-        weight_tying=False,
+        num_kv_heads=4,
+        norm_eps=1e-06,
+        rope_theta=1_000_000,
+        use_tied_embedding=False,
     )
+
+  # TODO(linchai): add other qwen2.5 model configs.
 
 
 def shard(x: jnp.ndarray, s: Tuple[str, ...]):
@@ -278,6 +268,24 @@ class Attention(nnx.Module):
     )
     self.n_rep = config.num_heads // config.num_kv_heads
     self.scale = self.head_dim**-0.5
+    self.q_bias = nnx.Param(
+        nnx.initializers.zeros_init()(
+            rngs.params(), config.num_heads * config.head_dim
+        ),
+        sharding=shd_config.qkv_bias,
+    )
+    self.k_bias = nnx.Param(
+        nnx.initializers.zeros_init()(
+            rngs.params(), config.num_kv_heads * config.head_dim
+        ),
+        sharding=shd_config.qkv_bias,
+    )
+    self.v_bias = nnx.Param(
+        nnx.initializers.zeros_init()(
+            rngs.params(), config.num_kv_heads * config.head_dim
+        ),
+        sharding=shd_config.qkv_bias,
+    )
 
   @jax.named_scope('attention')
   def __call__(
@@ -290,8 +298,16 @@ class Attention(nnx.Module):
     seq_len = x.shape[1]
 
     query_proj = self.q_proj(x)
+    b, t, n, h = query_proj.shape
+    query_proj = jnp.reshape(query_proj, (b, t, n * h)) + self.q_bias
+    query_proj = jnp.reshape(query_proj, (b, t, n, h))
     key_proj = self.k_proj(x)
+    _, s, k, h = key_proj.shape
+    key_proj = jnp.reshape(key_proj, (b, s, k * h)) + self.k_bias
+    key_proj = jnp.reshape(key_proj, (b, s, k, h))
     value_proj = self.v_proj(x)
+    value_proj = jnp.reshape(value_proj, (b, s, k * h)) + self.v_bias
+    value_proj = jnp.reshape(value_proj, (b, s, k, h))
 
     query_proj = shard(query_proj, self.shd_config.act_btnh)
     key_proj = shard(key_proj, self.shd_config.act_btnh)
@@ -435,14 +451,14 @@ class DecoderLayer(nnx.Module):
         rngs=rngs,
         shd_config=shd_config,
     )
-    self.mlp = MLP(
-        config=config,
-        rngs=rngs,
-        shd_config=shd_config,
-    )
     self.post_attention_layernorm = RMSNorm(
         config.embed_dim,
         norm_eps=config.norm_eps,
+        rngs=rngs,
+        shd_config=shd_config,
+    )
+    self.mlp = MLP(
+        config=config,
         rngs=rngs,
         shd_config=shd_config,
     )
@@ -464,12 +480,13 @@ class DecoderLayer(nnx.Module):
     attn_output += x
     residual = attn_output
     attn_output = self.post_attention_layernorm(attn_output)
-    outputs = residual + self.mlp(attn_output)
+    outputs = self.mlp(attn_output)
+    outputs = residual + outputs
     return cache, outputs
 
 
-class Llama3(nnx.Module):
-  """Llama3 model."""
+class Qwen2(nnx.Module):
+  """Qwen2.5 model."""
 
   def __init__(
       self,
@@ -495,7 +512,7 @@ class Llama3(nnx.Module):
         norm_eps=config.norm_eps,
         shd_config=shd_config,
     )
-    if not config.weight_tying:
+    if not self.config.use_tied_embedding:
       self.lm_head = Einsum(
           einsum_str='BTD,DV->BTV',
           shape=(config.embed_dim, config.vocab_size),
@@ -503,37 +520,22 @@ class Llama3(nnx.Module):
           sharding=shd_config.emb_dv,
       )
 
-  def get_model_input(self):
-    """Returns a dummy model input for the transformer."""
-    dummy_batch_size = 1
-    dummy_seq_len = 128
-    return {
-        'input_tokens': jnp.ones(
-            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
-        ),
-        'positions': jnp.ones(
-            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
-        ),
-        'cache': None,
-        'attention_mask': jnp.ones(
-            (dummy_batch_size, 1, dummy_seq_len), dtype=jnp.bool
-        ),
-    }
-
   def __call__(
       self,
       input_tokens: jaxtyping.Array,  # [B, L]
       positions: jaxtyping.Array,  # [B, L]
       cache: Cache | None,  # (sequence length L')
       attention_mask: jaxtyping.Array,  # [B, L, L']
+      output_hidden_states: bool = False,
   ) -> tuple[jaxtyping.Array, Cache | None]:
-    """Llama3 model.
+    """Qwen2 model.
 
     Args:
       input_tokens: input sequence of tokens.
       positions: input absolute positions.
       cache: Attention KV cache or None.
       attention_mask: transformer input mask.
+      output_hidden_states: whether to output the hidden states.
 
     Returns:
       predicted_logits, new_cache
@@ -557,230 +559,156 @@ class Llama3(nnx.Module):
         new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
 
     x = self.final_norm(x)
-
-    if self.config.weight_tying:
+    if output_hidden_states:
+      self.sow(nnx.Intermediate, 'all_hidden_states', x)
+    # Qwen2.5 0.5B-3B uses tied embedding, sharing weights for input and output.
+    if self.config.use_tied_embedding:
       logits = self.embedder.decode(x)
     else:
       logits = self.lm_head(x)
 
     return logits, new_cache  # pytype: disable=bad-return-type
 
-  @property
-  def num_embed(self) -> int:
-    return self.config.embed_dim
-
-  # For now, we are still passing sharding to vLLM, consider removing it after
-  # switching to the reshard API
   @staticmethod
   def to_hf_mappings():
-    if os.environ.get('NEW_MODEL_DESIGN') == 'True':
-      return {
-          'lm_head.w': ('lm_head.input_embedding_table_DV', (None, 'model')),
-          'embedder.input_embedding': (
-              'embedder.input_embedding_table_VD',
-              ('model', None),
-          ),
-          'layers.*.input_layernorm.w': (
-              'layers.*.pre_attention_norm.scale',
-              (None,),
-          ),
-          'layers.*.mlp.down_proj.kernel': (
-              'layers.*.mlp.kernel_down_proj_FD',
-              ('model', None),
-          ),
-          'layers.*.mlp.gate_proj.kernel': (
-              'layers.*.mlp.kernel_gating_DF',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.up_proj.kernel': (
-              'layers.*.mlp.kernel_up_proj_DF',
-              (None, 'model'),
-          ),
-          'layers.*.post_attention_layernorm.w': (
-              'layers.*.pre_mlp_norm.scale',
-              (None,),
-          ),
-          'layers.*.attn.k_proj.w': (
-              'layers.*.attn.kernel_k_proj_DKH',
-              (None, 'model', None),
-          ),
-          'layers.*.attn.o_proj.w': (
-              'layers.*.attn.kernel_o_proj_NHD',
-              ('model', None, None),
-          ),
-          'layers.*.attn.q_proj.w': (
-              'layers.*.attn.kernel_q_proj_DNH',
-              (None, 'model', None),
-          ),
-          'layers.*.attn.v_proj.w': (
-              'layers.*.attn.kernel_v_proj_DKH',
-              (None, 'model', None),
-          ),
-          'final_norm.w': ('final_norm.scale', (None,)),
-      }
-    else:
-      return {
-          'lm_head.w': ('lm_head', (None, 'model')),
-          'embedder.input_embedding': ('embed.embedding', ('model', None)),
-          'layers.*.input_layernorm.w': (
-              'model.layers.*.input_layernorm.scale',
-              (None,),
-          ),
-          'layers.*.mlp.down_proj.kernel': (
-              'model.layers.*.mlp.down_proj.kernel',
-              ('model', None),
-          ),
-          'layers.*.mlp.gate_proj.kernel': (
-              'model.layers.*.mlp.gate_proj.kernel',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.up_proj.kernel': (
-              'model.layers.*.mlp.up_proj.kernel',
-              (None, 'model'),
-          ),
-          'layers.*.post_attention_layernorm.w': (
-              'model.layers.*.post_attention_layernorm.scale',
-              (None,),
-          ),
-          'layers.*.attn.k_proj.w': (
-              'model.layers.*.self_attn.k_proj.kernel',
-              (None, 'model', None),
-          ),
-          'layers.*.attn.o_proj.w': (
-              'model.layers.*.self_attn.o_proj.kernel',
-              ('model', None, None),
-          ),
-          'layers.*.attn.q_proj.w': (
-              'model.layers.*.self_attn.q_proj.kernel',
-              (None, 'model', None),
-          ),
-          'layers.*.attn.v_proj.w': (
-              'model.layers.*.self_attn.v_proj.kernel',
-              (None, 'model', None),
-          ),
-          'final_norm.w': ('model.norm.scale', (None,)),
-      }
+    return {
+        'embedder.input_embedding': ('embed.embedding', ('model', None)),
+        'layers.*.input_layernorm.w': (
+            'model.layers.*.input_layernorm.scale',
+            (None,),
+        ),
+        'layers.*.mlp.down_proj.kernel': (
+            'model.layers.*.mlp.down_proj.kernel',
+            ('model', None),
+        ),
+        'layers.*.mlp.gate_proj.kernel': (
+            'model.layers.*.mlp.gate_proj.kernel',
+            (None, 'model'),
+        ),
+        'layers.*.mlp.up_proj.kernel': (
+            'model.layers.*.mlp.up_proj.kernel',
+            (None, 'model'),
+        ),
+        'layers.*.post_attention_layernorm.w': (
+            'model.layers.*.post_attention_layernorm.scale',
+            (None,),
+        ),
+        'layers.*.attn.k_proj.w': (
+            'model.layers.*.self_attn.k_proj.kernel',
+            (None, 'model', None),
+        ),
+        'layers.*.attn.o_proj.w': (
+            'model.layers.*.self_attn.o_proj.kernel',
+            ('model', None, None),
+        ),
+        'layers.*.attn.q_proj.w': (
+            'model.layers.*.self_attn.q_proj.kernel',
+            (None, 'model', None),
+        ),
+        'layers.*.attn.v_proj.w': (
+            'model.layers.*.self_attn.v_proj.kernel',
+            (None, 'model', None),
+        ),
+        'layers.*.attn.q_bias': (
+            'model.layers.*.self_attn.q_proj.bias',
+            ('model', None),
+        ),
+        'layers.*.attn.k_bias': (
+            'model.layers.*.self_attn.k_proj.bias',
+            ('model', None),
+        ),
+        'layers.*.attn.v_bias': (
+            'model.layers.*.self_attn.v_proj.bias',
+            ('model', None),
+        ),
+        'final_norm.w': ('model.norm.scale', (None,)),
+        'lm_head.w': ('lm_head', (None, 'model')),
+    }
 
   @staticmethod
   def lora_to_hf_mappings():
-    if os.environ.get('NEW_MODEL_DESIGN') == 'True':
-      return {
-          'layers.*.mlp.gate_proj.kernel_lora_a': (
-              'layers.*.mlp.kernel_gating_DF_lora_a',
-              (None, None),
-          ),
-          'layers.*.mlp.gate_proj.kernel_lora_b': (
-              'layers.*.mlp.kernel_gating_DF_lora_b',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.up_proj.kernel_lora_a': (
-              'layers.*.mlp.kernel_up_proj_DF_lora_a',
-              (None, None),
-          ),
-          'layers.*.mlp.up_proj.kernel_lora_b': (
-              'layers.*.mlp.kernel_up_proj_DF_lora_b',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.down_proj.kernel_lora_a': (
-              'layers.*.mlp.kernel_down_proj_FD_lora_a',
-              ('model', None),
-          ),
-          'layers.*.mlp.down_proj.kernel_lora_b': (
-              'layers.*.mlp.kernel_down_proj_FD_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.q_proj.w_lora_a': (
-              'layers.*.attn.kernel_q_proj_DNH_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.q_proj.w_lora_b': (
-              'layers.*.attn.kernel_q_proj_DNH_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.k_proj.w_lora_a': (
-              'layers.*.attn.kernel_k_proj_DKH_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.k_proj.w_lora_b': (
-              'layers.*.attn.kernel_k_proj_DKH_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.v_proj.w_lora_a': (
-              'layers.*.attn.kernel_v_proj_DKH_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.v_proj.w_lora_b': (
-              'layers.*.attn.kernel_v_proj_DKH_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.o_proj.w_lora_a': (
-              'layers.*.attn.kernel_o_proj_NHD_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.o_proj.w_lora_b': (
-              'layers.*.attn.kernel_o_proj_NHD_lora_b',
-              (None, None),
-          ),
-      }
-    else:
-      return {
-          'layers.*.mlp.gate_proj.kernel_lora_a': (
-              'model.layers.*.mlp.gate_proj.kernel_lora_a',
-              (None, None),
-          ),
-          'layers.*.mlp.gate_proj.kernel_lora_b': (
-              'model.layers.*.mlp.gate_proj.kernel_lora_b',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.up_proj.kernel_lora_a': (
-              'model.layers.*.mlp.up_proj.kernel_lora_a',
-              (None, None),
-          ),
-          'layers.*.mlp.up_proj.kernel_lora_b': (
-              'model.layers.*.mlp.up_proj.kernel_lora_b',
-              (None, 'model'),
-          ),
-          'layers.*.mlp.down_proj.kernel_lora_a': (
-              'model.layers.*.mlp.down_proj.kernel_lora_a',
-              ('model', None),
-          ),
-          'layers.*.mlp.down_proj.kernel_lora_b': (
-              'model.layers.*.mlp.down_proj.kernel_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.q_proj.w_lora_a': (
-              'layers.*.self_attn.q_proj.kernel_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.q_proj.w_lora_b': (
-              'layers.*.self_attn.q_proj.kernel_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.k_proj.w_lora_a': (
-              'layers.*.self_attn.k_proj.kernel_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.k_proj.w_lora_b': (
-              'layers.*.self_attn.k_proj.kernel_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.v_proj.w_lora_a': (
-              'layers.*.self_attn.v_proj.kernel_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.v_proj.w_lora_b': (
-              'layers.*.self_attn.v_proj.kernel_lora_b',
-              (None, None),
-          ),
-          'layers.*.attn.o_proj.w_lora_a': (
-              'layers.*.self_attn.o_proj.kernel_lora_a',
-              ('model', None),
-          ),
-          'layers.*.attn.o_proj.w_lora_b': (
-              'layers.*.self_attn.o_proj.kernel_lora_b',
-              (None, None),
-          ),
-      }
+    return {
+        'layers.*.mlp.gate_proj.kernel_lora_a': (
+            'model.layers.*.mlp.gate_proj.kernel_lora_a',
+            (None, None),
+        ),
+        'layers.*.mlp.gate_proj.kernel_lora_b': (
+            'model.layers.*.mlp.gate_proj.kernel_lora_b',
+            (None, 'model'),
+        ),
+        'layers.*.mlp.up_proj.kernel_lora_a': (
+            'model.layers.*.mlp.up_proj.kernel_lora_a',
+            (None, None),
+        ),
+        'layers.*.mlp.up_proj.kernel_lora_b': (
+            'model.layers.*.mlp.up_proj.kernel_lora_b',
+            (None, 'model'),
+        ),
+        'layers.*.mlp.down_proj.kernel_lora_a': (
+            'model.layers.*.mlp.down_proj.kernel_lora_a',
+            ('model', None),
+        ),
+        'layers.*.mlp.down_proj.kernel_lora_b': (
+            'model.layers.*.mlp.down_proj.kernel_lora_b',
+            (None, None),
+        ),
+        'layers.*.attn.q_proj.w_lora_a': (
+            'layers.*.self_attn.q_proj.kernel_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.q_proj.w_lora_b': (
+            'layers.*.self_attn.q_proj.kernel_lora_b',
+            (None, None),
+        ),
+        'layers.*.attn.k_proj.w_lora_a': (
+            'layers.*.self_attn.k_proj.kernel_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.k_proj.w_lora_b': (
+            'layers.*.self_attn.k_proj.kernel_lora_b',
+            (None, None),
+        ),
+        'layers.*.attn.v_proj.w_lora_a': (
+            'layers.*.self_attn.v_proj.kernel_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.v_proj.w_lora_b': (
+            'layers.*.self_attn.v_proj.kernel_lora_b',
+            (None, None),
+        ),
+        'layers.*.attn.o_proj.w_lora_a': (
+            'layers.*.self_attn.o_proj.kernel_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.o_proj.w_lora_b': (
+            'layers.*.self_attn.o_proj.kernel_lora_b',
+            (None, None),
+        ),
+        'layers.*.attn.q_bias_lora_a': (
+            'model.layers.*.self_attn.q_proj.bias_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.q_bias_lora_b': (
+            'model.layers.*.self_attn.q_proj.bias_lora_b',
+            ('model', None),
+        ),
+        'layers.*.attn.k_bias_lora_a': (
+            'model.layers.*.self_attn.k_proj.bias_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.k_bias_lora_b': (
+            'model.layers.*.self_attn.k_proj.bias_lora_b',
+            ('model', None),
+        ),
+        'layers.*.attn.v_bias_lora_a': (
+            'model.layers.*.self_attn.v_proj.bias_lora_a',
+            ('model', None),
+        ),
+        'layers.*.attn.v_bias_lora_b': (
+            'model.layers.*.self_attn.v_proj.bias_lora_b',
+            ('model', None),
+        ),
+    }
 
   @staticmethod
   def to_hf_transpose_keys():

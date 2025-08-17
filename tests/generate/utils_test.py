@@ -1,6 +1,7 @@
 # Copyright 2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
+#
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -13,9 +14,48 @@
 # limitations under the License.
 
 from absl.testing import absltest
+from flax import nnx
+import jax
+from jax import sharding
 import jax.numpy as jnp
 import numpy as np
 from tunix.generate import utils
+from tunix.rl import reshard
+
+
+PartitionSpec = sharding.PartitionSpec
+NamedSharding = sharding.NamedSharding
+Mesh = sharding.Mesh
+
+
+class MockState:
+
+  def __init__(self, params):
+    self.params = params
+
+  def flat_state(self):
+    return [(tuple(k.split(".")), MockParam(v)) for k, v in self.params.items()]
+
+  def from_flat_path(self, flat_path):
+    new_params = {}
+    for keys, param in flat_path:
+      new_params[".".join(keys)] = param.value
+    return MockState(new_params)
+
+
+class MockParam:
+
+  def __init__(self, value, value_sharding=None):
+    self.value = value
+    self.sharding = value_sharding
+
+
+class Logprob:
+
+  def __init__(self, logprob, rank=None, decoded_token=None):
+    self.logprob = logprob
+    self.rank = rank
+    self.decoded_token = decoded_token
 
 
 class UtilsTest(absltest.TestCase):
@@ -99,6 +139,113 @@ class UtilsTest(absltest.TestCase):
     for ids, expected in data:
       self.assertEqual(utils.find_last_non_pad_idx(jnp.array(ids), 0), expected)
 
+  def test_logprobs_basic_extraction(self):
+    token_ids = [271, 567, 15166]
+    logprobs = [
+        {271: Logprob(-1.71), 198: Logprob(-0.52)},
+        {567: Logprob(-0.37)},
+        {15166: Logprob(0.0)},
+    ]
+    expected = [-1.71, -0.37, 0.0]
+    self.assertEqual(
+        utils.get_logprobs_from_vllm_output(token_ids, logprobs),
+        expected,
+    )
 
-if __name__ == '__main__':
-  absltest.main()
+  def test_logprobs_extraction_with_missing_token(self):
+    token_ids = [100, 200]
+    logprobs = [{101: Logprob(-0.5)}, {200: Logprob(-1.2)}]
+    with self.assertRaises(ValueError):
+      utils.get_logprobs_from_vllm_output(token_ids, logprobs)
+
+  def test_transfer_state_with_mappings_tranpose_and_sharding_device(self):
+    device_count = len(jax.devices())
+    assert device_count % 2 == 0, "This example assumes even number of devices"
+
+    devices_array = np.array(jax.devices()).reshape((device_count // 2, 2))
+    mesh = Mesh(devices_array, axis_names=("data", "model"))
+
+    src_sharding = NamedSharding(mesh, PartitionSpec(None, "model"))
+    tgt_sharding = NamedSharding(mesh, PartitionSpec("data", "model"))
+    src_state = MockState({
+        "encoder.layer_0.weight": MockParam(
+            jnp.arange(16).reshape(2, 8).astype(jnp.float32),
+            value_sharding=src_sharding,
+        ),
+        "encoder.layer_1.weight": MockParam(
+            jnp.arange(16, 32).reshape(2, 8).astype(jnp.float32),
+            value_sharding=src_sharding,
+        ),
+    })
+    tgt_state = MockState({
+        "decoder.layer_0.weight": MockParam(
+            jnp.zeros((8, 2), dtype=jnp.float32), value_sharding=tgt_sharding
+        ),
+        "encoder.layer_0.weight": MockParam(
+            jnp.zeros((8, 2), dtype=jnp.float32), value_sharding=tgt_sharding
+        ),
+    })
+    mappings = {
+        "encoder.layer_0.weight": ("decoder.layer_0.weight", None),
+        "encoder.layer_1.weight": ("encoder.layer_0.weight", None),
+    }
+    transpose_keys = {
+        "weight": (1, 0),
+    }
+
+    new_tgt_state = utils.transfer_state_with_mappings(
+        src_state,
+        tgt_state,
+        key_mappings=mappings,
+        transpose_keys=transpose_keys,
+        reshard_fn=reshard.reshard_pytree,
+    )
+
+    expected_layer_0_weight = jnp.arange(16).reshape(2, 8).T
+    self.assertTrue(
+        jnp.array_equal(
+            new_tgt_state.params["decoder.layer_0.weight"],
+            expected_layer_0_weight,
+        )
+    )
+    expected_layer_1_weight = jnp.arange(16, 32).reshape(2, 8).T
+    self.assertTrue(
+        jnp.array_equal(
+            new_tgt_state.params["encoder.layer_1.weight"],
+            expected_layer_1_weight,
+        )
+    )
+    self.assertEqual(
+        new_tgt_state.params["decoder.layer_0.weight"].sharding, tgt_sharding
+    )
+    self.assertEqual(
+        new_tgt_state.params["encoder.layer_1.weight"].sharding, tgt_sharding
+    )
+
+  def test_transfer_state_with_padding(self):
+    # Create source module with smaller head dim
+    class DstModule(nnx.Module):
+
+      def __init__(self):
+        self.w = nnx.Param(jnp.zeros((2, 4, 128)))  # padded target shape
+
+    class SrcModule(nnx.Module):
+
+      def __init__(self):
+        self.w = nnx.Param(jnp.ones((2, 4, 64)))  # smaller than target
+
+    src = SrcModule()
+    dst = DstModule()
+
+    mappings = {
+        "w": ("w", None),
+    }
+
+    result = utils.transfer_state_with_mappings(src, dst, mappings)
+
+    # Validate shape
+    self.assertEqual(result.w.value.shape, (2, 4, 128))
+    # Validate original values copied correctly
+    self.assertTrue(jnp.allclose(result.w.value[:, :, :64], 1.0))
+    # Validate padded values are zero
+    self.assertTrue(jnp.allclose(result.w.value[:, :, 64:], 0.0))

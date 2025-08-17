@@ -12,24 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Demo script for GRPO with Llama3 model.
+r"""Demo script for GRPO with Llama3 model.
 
 This script demonstrates how to run GRPO with a Llama3 model. It includes
 training, evaluation, and inference.
+
+Example usage:
+python3 grpo_demo_llama3_qwen2.py --root-dir=/path/to/root_dir \
+--model-version=Qwen/Qwen2.5-0.5B
+
 """
 
 import argparse
-import functools
 import gc
 import json
 import os
 import pprint
 import re
+import shutil
 
+from absl import logging
 from flax import nnx
 import grain
 import huggingface_hub
-import humanize
 import jax
 from jax import numpy as jnp
 import optax
@@ -38,12 +43,19 @@ import qwix
 from tqdm.auto import tqdm
 import transformers
 from tunix.models.llama3 import model as llama_lib
-from tunix.models.llama3 import params
+from tunix.models.llama3 import params as llama_params
+from tunix.models.qwen2 import model as qwen2_lib
+from tunix.models.qwen2 import params as qwen2_params
 from tunix.rl import rl_cluster as rl_cluster_lib
+from tunix.rl import utils
 from tunix.rl.grpo import grpo_learner
 from tunix.rl.rollout import base_rollout
 from tunix.sft import metrics_logger
 
+
+logging.set_verbosity(logging.INFO)
+
+show_hbm_usage = utils.show_hbm_usage
 
 print(
     "This script is still WIP and you'll need to download all the data to"
@@ -63,6 +75,15 @@ parser.add_argument(
     required=False,
     help="The root dir of model, data, etc.",
 )
+parser.add_argument(
+    "--model-version",
+    type=str,
+    # default="meta-llama/Llama-3.1-8B-Instruct"
+    # default="meta-llama/Llama-3.2-3B-Instruct",
+    default="meta-llama/Llama-3.2-1B-Instruct",
+    required=False,
+    help="The model version to use.",
+)
 
 # Parse arguments
 args = parser.parse_args()
@@ -76,7 +97,7 @@ args = parser.parse_args()
 GCS_BUCKET_PREFIX = "gcs://tunix/"
 TRAIN_DATA_PATH_SUBDIR = "rl/grpo/data/gsm8k_train.json"
 TEST_DATA_PATH_SUBDIR = "rl/grpo/data/gsm8k_test.json"
-HF_MODEL_VERSION = "meta-llama/Llama-3.1-8B-Instruct"
+HF_MODEL_VERSION = args.model_version
 
 TRAIN_FRACTION = 1.0
 
@@ -91,10 +112,6 @@ VLLM_MODEL_SUBDIR = "rl/grpo/models/"
 VLLM_MODEL_VERSION = os.path.join(
     args.root_dir, VLLM_MODEL_SUBDIR, HF_MODEL_VERSION
 )
-if "8B" in HF_MODEL_VERSION:
-  SIMPLIFIED_MODEL_VERSION = "8b"
-else:
-  SIMPLIFIED_MODEL_VERSION = "1b"
 
 # ====== Base Model ======
 NNX_CKPT_DIR = os.path.join(args.root_dir, "rl/grpo/models/", HF_MODEL_VERSION)
@@ -103,11 +120,19 @@ NNX_CKPT_DIR = os.path.join(args.root_dir, "rl/grpo/models/", HF_MODEL_VERSION)
 SEED = 42
 
 # ====== LoRA ======
+ENABLE_LORA = False
 RANK = 64
 ALPHA = 64.0
 
 # ====== Sharding ======
-MESH = [(1, jax.device_count()), ("fsdp", "tp")]  # YY
+if "Qwen2.5-0.5B-Instruct" in args.model_version:
+  TOTAL_TPU_TO_USE = 2
+elif "Qwen2.5-7B-Instruct" in args.model_version:
+  TOTAL_TPU_TO_USE = 4
+else:
+  TOTAL_TPU_TO_USE = jax.device_count()
+
+MESH = [(1, TOTAL_TPU_TO_USE), ("fsdp", "tp")]  # YY
 
 # ====== GRPO ======
 # === Generation during GRPO training ===
@@ -136,7 +161,8 @@ EPSILON = 0.2
 
 # ====== Training ======
 # 2 is the max we can do on v5e-8 with llama3 8B model.
-BATCH_SIZE = 2
+# 4 is the max we can do on v5e-8 with llama3 1B model.
+BATCH_SIZE = 4
 # To speed up for quick workflow validation, we can change NUM_BATCHES to e.g. 2
 NUM_BATCHES = 1869
 # Keep `NUM_TEST_BATCHES` low so that evaluation runs quickly. It can be
@@ -173,7 +199,7 @@ CKPT_DIR = os.path.join(
 SAVE_INTERVAL_STEPS = (
     500  # To speed up for quick workflow validation, we can change it to e.g. 2
 )
-MAX_TO_KEEP = 4
+MAX_TO_KEEP = 1
 DO_MEM_PROFILING = False
 DO_MODEL_DISPLAY = False
 
@@ -189,8 +215,23 @@ GENERATION_CONFIGS = {
 
 # ====== Profiler ======
 PROFILER_PATH = os.path.join(
-    args.root_dir, "tunix/rl/grpo/demo/experiments/llama3/profiler"
+    args.root_dir, "rl/grpo/demo/experiments/llama3/profiler"
 )
+
+
+def delete_directory(path: str):
+  if os.path.exists(path):
+    if os.path.isdir(path):
+      shutil.rmtree(path)
+      print(f"Deleted directory: {path}")
+    else:
+      print(f"Path exists but is not a directory: {path}")
+  else:
+    print(f"Directory does not exist: {path}")
+
+
+# Delete local checkpoint directory
+delete_directory(CKPT_DIR)
 
 for name, obj in list(globals().items()):
   if isinstance(obj, jnp.ndarray):
@@ -245,47 +286,9 @@ def load_json_from_local(path):
     return json.loads(f.read())
 
 
-def show_hbm_usage(title=""):
-  """Prints the current HBM usage.
-
-  Args:
-    title: The title to print before the HBM usage.
-  """
-  fmt_size = functools.partial(humanize.naturalsize, binary=True)
-  # Force a GC sweep to catch recently deallocated arrays
-  gc.collect()
-  try:
-    import pathwaysutils  # pylint: disable=g-import-not-at-top, unused-import
-
-    print("Using Pathways compatible HBM stats collector")
-
-    # Track usage per device
-    usage_by_device = {d: 0 for d in jax.local_devices()}
-
-    for mem_obj in gc.get_objects():
-      try:
-        if isinstance(mem_obj, jax.Array):
-          device = mem_obj.device()
-          usage_by_device[device] += mem_obj.size * mem_obj.dtype.itemsize
-      except Exception:  # pylint: disable=broad-except
-        continue  # Skip objects that raise
-
-    for d, used in usage_by_device.items():
-      print(f"{title} -- Using {fmt_size(used)} on {d}")
-  except Exception:  # pylint: disable=broad-except
-    print("Pathways not available. Using non Pathways HBM stats collector")
-
-    for d in jax.local_devices():
-      stats = d.memory_stats()
-      used = stats["bytes_in_use"]
-      limit = stats["bytes_limit"]
-      print(
-          f"{title} -- Using {fmt_size(used)} /"
-          f" {fmt_size(limit)} ({used/limit:%}) on {d}"
-      )
-
-
 show_hbm_usage()
+
+model_tokenizer = transformers.AutoTokenizer.from_pretrained(VLLM_MODEL_VERSION)
 
 reasoning_start = "<reasoning>"
 reasoning_end = "</reasoning>"
@@ -329,8 +332,18 @@ def get_dataset(path: str) -> grain.MapDataset:
       .map(
           lambda x: {
               # passed to model forward pass
-              "prompts": TEMPLATE.format(
-                  system_prompt=SYSTEM_PROMPT, question=x["question"]
+              "prompts": model_tokenizer.apply_chat_template(
+                  [
+                      {
+                          "role": "user",
+                          "content": TEMPLATE.format(
+                              system_prompt=SYSTEM_PROMPT,
+                              question=x["question"],
+                          ),
+                      },
+                  ],
+                  tokenize=False,
+                  add_generation_prompt=True,
               ),
               # passed to reward functions
               "question": x["question"],
@@ -365,22 +378,33 @@ for ele in train_dataset[:1]:
   pprint.pprint(ele)
 
 MODEL_CONFIG = {
-    "1b": llama_lib.ModelConfig.llama3_1b,
-    "8b": llama_lib.ModelConfig.llama3_8b,
+    "meta-llama/Llama-3.2-1B-Instruct": llama_lib.ModelConfig.llama3_2_1b,
+    "meta-llama/Llama-3.2-3B-Instruct": llama_lib.ModelConfig.llama3_2_3b,
+    "meta-llama/Llama-3.1-8B-Instruct": llama_lib.ModelConfig.llama3_1_8b,
+    "Qwen/Qwen2.5-0.5B-Instruct": qwen2_lib.ModelConfig.qwen2_5_0_5_b,
+    "Qwen/Qwen2.5-7B-Instruct": qwen2_lib.ModelConfig.qwen2_5_7_b,
 }
 
 
-def get_llama_model(ckpt_path, model_mesh):
-  return params.create_model_from_safe_tensors(
-      ckpt_path, llama_lib.ModelConfig.llama3_8b(), model_mesh
+def get_trainer_model(ckpt_path, model_mesh, ref_model_config):
+  if "Llama" in HF_MODEL_VERSION:
+    return llama_params.create_model_from_safe_tensors(
+        ckpt_path, ref_model_config, model_mesh
+    )
+  elif "Qwen2.5" in HF_MODEL_VERSION:
+    return qwen2_params.create_model_from_safe_tensors(
+        ckpt_path, ref_model_config, model_mesh
+    )
+  raise NotImplementedError(
+      f"{HF_MODEL_VERSION} tensor loading not implemented"
   )
 
 
 def get_ref_model():
   ckpt_path = os.path.join(NNX_CKPT_DIR)
-  model_mesh = jax.make_mesh(*MESH)
-  ref_model_config = MODEL_CONFIG[SIMPLIFIED_MODEL_VERSION]()
-  model = get_llama_model(ckpt_path, model_mesh)
+  model_mesh = jax.make_mesh(*MESH, devices=jax.devices()[:TOTAL_TPU_TO_USE])
+  ref_model_config = MODEL_CONFIG[HF_MODEL_VERSION]()
+  model = get_trainer_model(ckpt_path, model_mesh, ref_model_config)
   return model, model_mesh, ref_model_config
 
 
@@ -428,9 +452,10 @@ if DO_MODEL_DISPLAY:
 
 # Policy model
 # TODO(b/434959964): Supports lora in vLLM Jax backend
-# lora_transformer = get_lora_model(transformer, mesh=mesh)
+lora_transformer = (
+    get_lora_model(transformer, model_mesh=mesh) if ENABLE_LORA else transformer
+)
 
-lora_transformer = transformer
 if DO_MODEL_DISPLAY:
   nnx.display(lora_transformer)
 
@@ -716,8 +741,6 @@ def evaluate(
   return to_return
 
 
-model_tokenizer = transformers.AutoTokenizer.from_pretrained(VLLM_MODEL_VERSION)
-
 show_hbm_usage("After creating a raw sampler")
 
 # Ckpt saving
@@ -779,7 +802,9 @@ cluster_config = rl_cluster_lib.ClusterConfig(
         top_p=TOP_P,
         top_k=TOP_K,
     ),
-    rollout_model_version=VLLM_MODEL_VERSION,
+    rollout_vllm_model_version=VLLM_MODEL_VERSION,
+    rollout_vllm_hbm_utilization=0.2,
+    rollout_vllm_tpu_backend_type="jax",
 )
 
 grpo_config = grpo_learner.GrpoConfig(
@@ -854,9 +879,10 @@ show_hbm_usage("After training the reference lora model")
 
 trained_ckpt_path = os.path.join(CKPT_DIR, str(MAX_STEPS), "model_params")
 
+filter_type = nnx.LoRAParam if ENABLE_LORA else nnx.Param
 abs_params = jax.tree.map(
     lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
-    nnx.state(lora_transformer, nnx.LoRAParam),
+    nnx.state(lora_transformer, filter_type),
 )
 checkpointer = ocp.StandardCheckpointer()
 trained_lora_params = checkpointer.restore(trained_ckpt_path, target=abs_params)
@@ -865,7 +891,7 @@ nnx.update(
     lora_transformer,
     jax.tree.map(
         lambda a, b: b,
-        nnx.state(lora_transformer, nnx.LoRAParam),
+        nnx.state(lora_transformer, filter_type),
         trained_lora_params,
     ),
 )

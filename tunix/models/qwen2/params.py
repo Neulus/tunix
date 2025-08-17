@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utils for loading and converting Llama3 PT weights."""
+"""Utils for loading and converting Qwen2 PT weights."""
 
 import re
 from etils import epath
 from flax import nnx
 import jax
 import safetensors.flax as safetensors
-from tunix.models.llama3 import model as model_lib
+import tqdm
+from tunix.models.qwen2 import model as model_lib
 
 
 def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
@@ -43,6 +44,18 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
           r"layers.\1.attn.o_proj.w",
           ((1, 0), (cfg.num_heads, cfg.head_dim, cfg.embed_dim)),
       ),
+      r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.bias": (
+          r"layers.\1.attn.q_bias",
+          None,
+      ),
+      r"model\.layers\.([0-9]+)\.self_attn\.k_proj\.bias": (
+          r"layers.\1.attn.k_bias",
+          None,
+      ),
+      r"model\.layers\.([0-9]+)\.self_attn\.v_proj\.bias": (
+          r"layers.\1.attn.v_bias",
+          None,
+      ),
       # mlp
       r"model\.layers\.([0-9]+)\.mlp\.gate_proj\.weight": (
           r"layers.\1.mlp.gate_proj.kernel",
@@ -56,16 +69,8 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
           r"layers.\1.mlp.down_proj.kernel",
           ((1, 0), None),
       ),
-      r"model\.norm\.weight": ("final_norm.w", None),
       # norms
-      r"model\.layers\.([0-9]+)\.self_attn\.q_norm\.weight": (
-          r"layers.\1.attn.q_norm.w",
-          None,
-      ),
-      r"model\.layers\.([0-9]+)\.self_attn\.k_norm\.weight": (
-          r"layers.\1.attn.k_norm.w",
-          None,
-      ),
+      r"model\.norm\.weight": ("final_norm.w", None),
       # layer norms (pre/post attention)
       r"model\.layers\.([0-9]+)\.input_layernorm\.weight": (
           r"layers.\1.input_layernorm.w",
@@ -86,7 +91,7 @@ def _torch_key_to_jax_key(mapping, source_key):
       if re.match(pat, source_key)
   ]
   if len(subs) != 1:
-    raise ValueError(f"Only one key should be found: {subs} for {source_key}")
+    raise ValueError(f"Only one key should be found: {subs[0]}")
   else:
     return subs[0]
 
@@ -131,86 +136,36 @@ def create_model_from_safe_tensors(
     file_dir: str,
     config: model_lib.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
-) -> model_lib.Llama3:
-  """Load tensors from the safetensors file and create a Llama3 model."""
+) -> model_lib.Qwen2:
+  """Load tensors from the safetensors file and create a Qwen3 model."""
   files = list(epath.Path(file_dir).expanduser().glob("*.safetensors"))
 
   if not files:
     raise ValueError(f"No safetensors found in {file_dir}")
 
-  llama3 = nnx.eval_shape(
-      lambda: model_lib.Llama3(config, rngs=nnx.Rngs(params=0))
+  tensor_dict = {}
+  for f in tqdm.tqdm(files):
+    tensor_dict |= safetensors.load_file(f)
+
+  qwen2 = nnx.eval_shape(
+      lambda: model_lib.Qwen2(config, rngs=nnx.Rngs(params=0))
   )
-  graph_def, abs_state = nnx.split(llama3)
+
+  graph_def, abs_state = nnx.split(qwen2)
   state_dict = abs_state.to_pure_dict()
 
+  with jax.default_device(jax.devices("cpu")[0]):
+    for k, v in tqdm.tqdm(tensor_dict.items()):
+      jax_key, transform = _torch_key_to_jax_key(
+          _get_key_and_transform_mapping(config), k
+      )
+      jax_keys = [_stoi(s) for s in jax_key.split(".")]
+      _assign_weights(jax_keys, v, state_dict, k, transform)
+
   if mesh is not None:
-    sharding_dict = nnx.get_named_sharding(abs_state, mesh).to_pure_dict()
+    sharding = nnx.get_named_sharding(abs_state, mesh).to_pure_dict()
+    state_dict = jax.device_put(state_dict, sharding)
   else:
-    sharding_dict = None
-
-  key_map = _get_key_and_transform_mapping(config)
-
-  def path_to_key(path):
-    return ".".join(
-        str(_stoi(key.key if hasattr(key, "key") else key)) for key in path
-    )
-
-  for f in files:
-    file_loaded_tensors = {}
-    with safetensors.safe_open(f, framework="numpy") as sf:
-      for k_name in sf.keys():
-        try:
-          v = sf.get_tensor(k_name)
-          jax_key_mapped, transform = _torch_key_to_jax_key(key_map, k_name)
-
-          if transform is not None:
-            permute, reshape = transform
-            if permute:
-              v = v.transpose(permute)
-            if reshape:
-              v = v.reshape(reshape)
-
-          current_arr = jax.numpy.array(v)
-
-          if jax_key_mapped in file_loaded_tensors:
-            raise ValueError(
-                f"Duplicate key {jax_key_mapped} found within file {f.name}."
-            )
-          file_loaded_tensors[jax_key_mapped] = current_arr
-
-        except Exception as e:
-          raise RuntimeError(
-              f"Failed to load tensor {k_name} from file {f.name}: {e}"
-          ) from e
-
-    def make_update_tensor_fn(current_file_tensors):
-      def update_tensor(path, param, shard=None):
-        current_path_key = path_to_key(path)
-        if current_path_key in current_file_tensors:
-          loaded_arr = current_file_tensors[current_path_key]
-          if loaded_arr.shape != param.shape:
-            raise ValueError(
-                f"Shape mismatch for {current_path_key}: got"
-                f" {loaded_arr.shape}, expected {param.shape}"
-            )
-          if shard is not None:
-            return jax.device_put(loaded_arr, shard)
-          else:
-            return jax.device_put(loaded_arr, jax.devices()[0])
-        return param
-
-      return update_tensor
-
-    current_file_update_tensor = make_update_tensor_fn(file_loaded_tensors)
-
-    if sharding_dict is not None:
-      state_dict = jax.tree.map_with_path(
-          current_file_update_tensor, state_dict, sharding_dict
-      )
-    else:
-      state_dict = jax.tree.map_with_path(
-          current_file_update_tensor, state_dict
-      )
+    state_dict = jax.device_put(state_dict, jax.devices()[0])
 
   return nnx.merge(graph_def, state_dict)

@@ -13,9 +13,11 @@
 # limitations under the License.
 
 """Sampler for vLLM-style autoregressive decoding using JAX and NNX models."""
+
 import dataclasses
 import os
 from typing import Any, Dict, List, Optional, Tuple
+
 from absl import logging
 import jax
 import jax.numpy as jnp
@@ -23,19 +25,13 @@ import jaxtyping
 from tunix.generate import base_sampler
 from tunix.generate import utils
 import tunix.generate.tokenizer_adapter as tok_adapter
-from vllm.entrypoints.llm import LLM
+from tunix.rl import reshard
+from vllm import LLM
 from vllm.outputs import RequestOutput
 
 
-# vLLM recommends use the old model design
-# os.environ["NEW_MODEL_DESIGN"]= "True"
-# Enable Jax backend
-os.environ["TPU_BACKEND_TYPE"] = "jax"
 # Colocate vllm engine and worker in the main process
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-# Init vLLM model with random weights because model weights are synced from
-# trainer later on
-os.environ["JAX_RANDOM_WEIGHTS"] = "True"
 
 
 @dataclasses.dataclass
@@ -44,6 +40,17 @@ class MappingConfig:
   lora_to_hf_mappings: Optional[Dict[str, str]]
   to_hf_transpose_keys: Optional[Dict[str, Tuple[int, ...]]]
   lora_config: Optional[Dict[str, Any]]
+
+
+@dataclasses.dataclass
+class VllmConfig:
+  model_version: str
+  max_model_len: int
+  mesh: jax.sharding.Mesh
+  hbm_utilization: float
+  init_with_random_weights: bool
+  tpu_backend_type: str
+  mapping_config: MappingConfig
 
 
 class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
@@ -59,71 +66,72 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
   def __init__(
       self,
       tokenizer: Any,
-      mesh: jax.sharding.Mesh,
-      max_model_len: int,
-      model_version: str,
-      mapping_config: MappingConfig,
-      hbm_utilization: Optional[float] = 0.3,
+      config: VllmConfig,
   ):
     """Initializes the VllmSampler.
 
     Args:
         tokenizer (Any): A tokenizer compatible with the model.
-        mesh (jax.sharding.Mesh): The JAX mesh for parallel execution.
-        max_model_len (int): Maximum sequence (prompt + generation) length
-          supported by vLLM.
-        model_version (Optional[str]): The model version identifier.
-        mapping_config: The config for weight name mappings from external model
-          to vLLM model, including to_hf_mappings, lora_to_hf_mappings,
-          to_hf_transpose_keys and lora_config.
-        hbm_utilization (Optional[float], optional): Fraction of HBM memory to
-          utilize for vLLM. Mainly for KV cache size tuning. Defaults to 0.3.
+        config: The vllm related configurations
     """
-    self.tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
-    self.model_version = model_version
-    self.max_model_len = max_model_len
-    self.mesh = mesh
-    self.lora_config = mapping_config.lora_config
-    self.hbm_utilization = hbm_utilization
 
-    self.args = self._vllm_config()
+    # Select vllm TPU backend type, there are jax, torchax and torchxla
+    if config.tpu_backend_type:
+      os.environ["TPU_BACKEND_TYPE"] = config.tpu_backend_type
+    # Init vLLM model with random weights to speed up bootstrap time, because
+    # model weights are synced from trainer later on
+    if config.init_with_random_weights:
+      os.environ["JAX_RANDOM_WEIGHTS"] = "True"
+
+    self.tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
+    self.args = self._vllm_config(config)
     self.llm = LLM(**self.args)
 
-    self.mappings = mapping_config.to_hf_mappings
-    self.to_hf_transpose_keys = mapping_config.to_hf_transpose_keys
+    self.mappings = config.mapping_config.to_hf_mappings
+    self.to_hf_transpose_keys = config.mapping_config.to_hf_transpose_keys
 
     # TODO(b/434959964) It's not taking effect until vLLM Jax backend support
     # lora.
     if (
-        mapping_config.lora_config is not None
-        and mapping_config.lora_to_hf_mappings is not None
+        config.mapping_config.lora_config is not None
+        and config.mapping_config.lora_to_hf_mappings is not None
     ):
-      self.mappings |= mapping_config.lora_to_hf_mappings
+      self.mappings |= config.mapping_config.lora_to_hf_mappings
 
   # TODO(b/434969743): Optimize weight sharing between trainer and vllm sampler.
   # TODO(b/434975493): Consider Release KV cache on the fly
-  def update_params(self, updated_weights: jaxtyping.PyTree):
-    self.llm.llm_engine.model_executor.collective_rpc(
-        "sync_weights",
-        args=(updated_weights, self.mappings, self.to_hf_transpose_keys),
+  def update_params(
+      self,
+      updated_weights: jaxtyping.PyTree,
+      filter_types: Optional[Tuple[Any, ...]] = None,
+  ):
+    del filter_types
+    utils.transfer_state_with_mappings(
+        src_state=updated_weights,
+        dst_state=self.transformer_state,
+        key_mappings=self.mappings,
+        transpose_keys=self.to_hf_transpose_keys,
+        reshard_fn=reshard.reshard_pytree,
     )
 
   def load_checkpoint(self, path_or_weights: str | jaxtyping.PyTree):
     # TODO(b/434741253): Consider support orbax checkpoint loading
     if isinstance(path_or_weights, jaxtyping.PyTree):
-      self.update_params(updated_weights=path_or_weights)
+      self.update_params(updated_weights=path_or_weights, filter_types=None)
     else:
       raise NotImplementedError("Only support in memory weight sync as of now.")
 
-  def _vllm_config(self):
+  def _vllm_config(self, config: VllmConfig):
     args = {}
     args["additional_config"] = {}
-    args["model"] = self.model_version
-    args["max_model_len"] = self.max_model_len
-    args["tensor_parallel_size"] = self.mesh.shape["tp"]
-    args["gpu_memory_utilization"] = self.hbm_utilization
-    if self.lora_config is not None:
-      args["additional_config"]["lora_config"] = self.lora_config
+    args["model"] = config.model_version
+    args["max_model_len"] = config.max_model_len
+    args["tensor_parallel_size"] = config.mesh.shape["tp"]
+    args["gpu_memory_utilization"] = config.hbm_utilization
+    if config.mapping_config.lora_config is not None:
+      args["additional_config"][
+          "lora_config"
+      ] = config.mapping_config.lora_config
     return args
 
   @property
@@ -137,7 +145,10 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   @property
   def transformer_state(self):
-    return self._model_runner.state
+    if hasattr(self._model_runner, "state"):
+      return self._model_runner.state
+    else:
+      raise AttributeError("vLLM model runner doesn't have state.")
 
   def tokenize(self, input_string: str) -> List[int]:
     """Tokenizes the input string."""
@@ -147,32 +158,12 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         if (self.tokenizer.bos_id() and input_ids[0] != self.tokenizer.bos_id())
         else []
     )
-    return bos_tok + input_ids
-
-  def _get_logprobs_from_vllm_output(
-      self, logprobs: List[Optional[Dict[int, Any]]]
-  ) -> List[float]:
-    # Below is to get the log probs from vLLM output
-    if logprobs is None or logprobs[0] is None:
-      logging.debug("Logprobs are missing")
-      return []
-
-    assert len(logprobs[0]) == 1, (
-        f"The log probs contains more than 1 ({len(logprobs[0])} token per"
-        " position"
+    eos_tok = (
+        [self.tokenizer.eos_id()]
+        if input_ids[-1] != self.tokenizer.eos_id()
+        else []
     )
-
-    try:
-      result = [
-          list(logprob_dict.values())[0].logprob
-          for logprob_dict in logprobs
-          if logprob_dict is not None and logprob_dict.values()
-      ]
-    except Exception as e:  # pylint: disable=broad-except
-      logging.error("Failed to get logprobs from vLLM output: %s", e)
-      result = []
-
-    return result
+    return bos_tok + input_ids + eos_tok
 
   def detokenize(
       self, input_strings: List[str], request_outputs: List[RequestOutput]
@@ -194,7 +185,9 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
         decoded_outputs[idx].append(
             self.tokenizer.decode(single_output.token_ids)
         )
-        logprobs = self._get_logprobs_from_vllm_output(single_output.logprobs)
+        logprobs = utils.get_logprobs_from_vllm_output(
+            single_output.token_ids, single_output.logprobs
+        )
         out_logprobs[idx].append(logprobs)
         logging.debug(
             "Prompt: %r\n\nGenerated text: %r\n\n ",
